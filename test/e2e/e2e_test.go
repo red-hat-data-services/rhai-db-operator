@@ -48,6 +48,8 @@ const (
 	managerDeployment = "odh-db-operator-operator"
 	managerBinding    = "odh-db-operator-manager-rolebinding"
 	leaderBinding     = "odh-db-operator-leader-election-rolebinding"
+	e2eOwnerLabel     = "shiftleft.opendatahub.io/owner"
+	e2eOwnerValue     = "rhai-db-operator"
 )
 
 func TestMain(m *testing.M) {
@@ -56,7 +58,7 @@ func TestMain(m *testing.M) {
 	SetDefaultEventuallyPollingInterval(gomegaCfg.EventuallyPollingInterval)
 	SetDefaultConsistentlyPollingInterval(gomegaCfg.ConsistentlyPollingInterval)
 
-	m.Run()
+	os.Exit(m.Run())
 }
 
 // TestHelmInstalledManagerReconcilesDatabaseService proves the chart-installed
@@ -139,7 +141,12 @@ func TestHelmInstalledManagerReconcilesDatabaseService(t *testing.T) {
 		release, namespace, deployment.Name, managerImage, serviceAccountName)
 
 	instance := &servicesv1alpha1.DatabaseService{
-		ObjectMeta: metav1.ObjectMeta{Name: servicesv1alpha1.DatabaseServiceInstanceName},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: servicesv1alpha1.DatabaseServiceInstanceName,
+			Labels: map[string]string{
+				e2eOwnerLabel: e2eOwnerValue,
+			},
+		},
 	}
 	g.Expect(kubeClient.Create(ctx, instance)).To(Succeed(),
 		"creating the singleton DatabaseService; the e2e setup should remove leftovers before each run")

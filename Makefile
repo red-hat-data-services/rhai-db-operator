@@ -192,10 +192,20 @@ container-build: ## Build container image with the manager (podman).
 container-push: ## Push container image with the manager.
 	$(CONTAINER_TOOL) push "$(IMG)"
 
+.PHONY: container-build-e2e
+container-build-e2e: ## Build the dedicated container image with the e2e test runner.
+	$(CONTAINER_TOOL) build -f "$(E2E_TEST_DOCKERFILE)" -t "$(E2E_TEST_IMG)" .
+
+.PHONY: container-push-e2e
+container-push-e2e: ## Push the dedicated e2e test-runner image.
+	$(CONTAINER_TOOL) push "$(E2E_TEST_IMG)"
+
 KIND_CLUSTER ?= db-operator-dev
 TEST_INTEGRATION_CONTEXT ?= kind-$(KIND_CLUSTER)
 E2E_NAMESPACE ?= opendatahub-db-operator-e2e
 E2E_RELEASE   ?= opendatahub-db-operator-e2e
+E2E_TEST_IMG ?= quay.io/rhoai/odh-db-operator-e2e-rhel9:rhoai-3.6
+E2E_TEST_DOCKERFILE ?= test/e2e/Dockerfile
 
 .PHONY: container-load-kind
 container-load-kind: ## Load $(IMG) into a Kind cluster. `kind load docker-image` doesn't work with the podman provider.
