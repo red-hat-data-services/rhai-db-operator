@@ -9,12 +9,16 @@
 !cmd/
 !api/
 !assets/
+!assets/**
 !internal/
 !pkg/
 
 # Re-include Go source files (but not *_test.go)
 !**/*.go
 **/*_test.go
+
+# Embedded manifest templates (go:embed manifests/** in assets/assets.go)
+!**/*.yaml.tmpl
 
 # Re-include Go module files
 !go.mod
