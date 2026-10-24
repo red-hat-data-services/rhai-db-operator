@@ -44,14 +44,14 @@ const testNamespacePrefix = "opendatahub-db-operator-databaseservice-it"
 
 // TestDatabaseServiceReconcilesToReady verifies status writes against a connected cluster.
 func TestDatabaseServiceReconcilesToReady(t *testing.T) {
-	g := NewWithT(t)
-
 	ctrl.SetLogger(logr.Discard())
 
+	// NewWithT snapshots duration defaults; set them before constructing g.
 	gomegaCfg := support.LoadGomegaConfig()
 	SetDefaultEventuallyTimeout(gomegaCfg.EventuallyTimeout)
 	SetDefaultEventuallyPollingInterval(gomegaCfg.EventuallyPollingInterval)
 	SetDefaultConsistentlyPollingInterval(gomegaCfg.ConsistentlyPollingInterval)
+	g := NewWithT(t)
 
 	restCfg, err := ctrl.GetConfig()
 	g.Expect(err).NotTo(HaveOccurred(), "no kubeconfig / current context -- this test needs a real, connected cluster")
@@ -81,6 +81,7 @@ func TestDatabaseServiceReconcilesToReady(t *testing.T) {
 	cfg.Controller.Metrics.BindAddress = "0"
 	cfg.Controller.Health.BindAddress = "0"
 	cfg.Controller.Pprof.BindAddress = "0"
+	cfg.Controller.Webhook.Enabled = false
 	cfg.Controller.LeaderElection.Enabled = true
 	cfg.Controller.LeaderElection.ID = "opendatahub-db-operator-databaseservice-it-lock"
 

@@ -26,6 +26,17 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+func TestWrapOpenShiftAPIGuard(t *testing.T) {
+	g := NewWithT(t)
+	wrapped := wrapOpenShiftAPIGuard("kind: SecurityContextConstraints\n")
+	g.Expect(wrapped).To(HavePrefix(
+		"{{- if or .Values.openshift.securityContextConstraints" +
+			" (.Capabilities.APIVersions.Has \"security.openshift.io/v1\") }}",
+	))
+	g.Expect(wrapped).To(ContainSubstring("kind: SecurityContextConstraints"))
+	g.Expect(wrapped).To(HaveSuffix("{{- end }}\n"))
+}
+
 // The sidecar's "image" field is deliberately its first key (serializes as
 // "- image: ...") -- the shape the old line-prefix matcher missed -- while
 // the manager container's image is not its first key, the shape it did
@@ -84,6 +95,54 @@ func TestTransformDeployment_OnlyTemplatesManagerContainerImage(t *testing.T) {
 	// generated chart -- they're only reachable via the Values templates.
 	g.Expect(rendered).NotTo(ContainSubstring("controller:latest"))
 	g.Expect(strings.Count(rendered, `{{ include "chart.imageRef" . }}`)).To(Equal(1))
+}
+
+func TestTransformDeployment_TemplatesWebhookPortFromConfig(t *testing.T) {
+	g := NewWithT(t)
+
+	obj := unstructuredFromYAML(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manager
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        ports:
+        - name: webhook-server
+          containerPort: 9443
+        - name: health
+          containerPort: 8081
+        volumeMounts:
+        - name: cert
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+      - name: proxy
+        ports:
+        - name: webhook-server
+          containerPort: 9444
+        volumeMounts:
+        - name: cert
+          mountPath: /proxy/certs
+`)
+
+	rendered, err := transformDeployment(&obj, false, true)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(rendered).To(ContainSubstring(
+		`containerPort: {{ default 9443 (int (index .Values.config "controller.webhook.port")) }}`,
+	))
+	g.Expect(rendered).To(ContainSubstring("containerPort: 8081"))
+	g.Expect(rendered).To(ContainSubstring("containerPort: 9444"))
+	g.Expect(rendered).To(ContainSubstring(
+		`mountPath: {{ default "` + webhookCertDirDefault + `"`,
+	))
+	g.Expect(rendered).To(ContainSubstring(
+		`(index .Values.config "controller.webhook.cert-dir") | quote }}`,
+	))
+	g.Expect(rendered).To(ContainSubstring("mountPath: /proxy/certs"))
+	g.Expect(strings.Count(rendered, "default 9443")).To(Equal(1))
+	g.Expect(strings.Count(rendered, `default "/tmp/k8s-webhook-server/serving-certs"`)).To(Equal(1))
 }
 
 // A binding with a mix of subjects -- the operator's own ServiceAccount plus

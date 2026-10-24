@@ -47,14 +47,14 @@ import (
 
 // TestDatabaseServiceReconcilesToReady verifies status writes against the local API server.
 func TestDatabaseServiceReconcilesToReady(t *testing.T) {
-	g := NewWithT(t)
-
 	ctrl.SetLogger(logr.Discard())
 
+	// NewWithT snapshots duration defaults; set them before constructing g.
 	gomegaCfg := support.LoadGomegaConfig()
 	SetDefaultEventuallyTimeout(gomegaCfg.EventuallyTimeout)
 	SetDefaultEventuallyPollingInterval(gomegaCfg.EventuallyPollingInterval)
 	SetDefaultConsistentlyPollingInterval(gomegaCfg.ConsistentlyPollingInterval)
+	g := NewWithT(t)
 
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
@@ -82,6 +82,7 @@ func TestDatabaseServiceReconcilesToReady(t *testing.T) {
 	cfg.Controller.Metrics.BindAddress = "0"
 	cfg.Controller.Health.BindAddress = "0"
 	cfg.Controller.Pprof.BindAddress = "0"
+	cfg.Controller.Webhook.Enabled = false
 
 	mgr, err := modulemanager.New(ctx, restCfg, cfg)
 	g.Expect(err).NotTo(HaveOccurred())

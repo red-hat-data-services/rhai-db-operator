@@ -49,6 +49,26 @@ func TestLoad_PostgresImage(t *testing.T) {
 	g.Expect(cfg.PostgresImage).To(Equal("registry.example.test/rhel9/postgresql-16"))
 }
 
+func TestLoad_WebhookDefaults(t *testing.T) {
+	g := NewWithT(t)
+
+	cfg, err := config.Load()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cfg.Controller.Webhook.Enabled).To(BeTrue())
+	g.Expect(cfg.Controller.Webhook.Port).To(Equal(9443))
+	g.Expect(cfg.Controller.Webhook.CertDir).To(Equal("/tmp/k8s-webhook-server/serving-certs"))
+}
+
+func TestLoad_EmptyPostgresImageFallsBackToDefault(t *testing.T) {
+	g := NewWithT(t)
+
+	cfg, err := config.Load(config.WithFS(fstest.MapFS{
+		"postgres-image": {Data: []byte("   ")},
+	}))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(cfg.PostgresImage).To(Equal(config.DefaultInternalPostgresImage))
+}
+
 func TestLoad_ParsesPlatformVersion(t *testing.T) {
 	g := NewWithT(t)
 

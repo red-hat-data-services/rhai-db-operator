@@ -31,9 +31,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	webhookserver "sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	servicesv1alpha1 "github.com/opendatahub-io/opendatahub-db-operator/api/services/v1alpha1"
+	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/databaseclaim"
 	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/databaseprovider"
 	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/databaseservice"
 	moduleconfig "github.com/opendatahub-io/opendatahub-db-operator/pkg/config"
@@ -67,7 +69,10 @@ func NewScheme() (*runtime.Scheme, error) {
 	return scheme, nil
 }
 
-// New creates the manager and registers the DatabaseService reconciler.
+// New creates the manager and registers reconcilers. DatabaseService always
+// registers; DatabaseProvider and DatabaseClaim register only when their CRDs
+// are present so the operator can still reconcile the module singleton when
+// infrastructure CRDs are not installed yet.
 func New(
 	ctx context.Context,
 	kubeConfig *rest.Config,
@@ -90,8 +95,17 @@ func New(
 		pprofBindAddress = cfg.Controller.Pprof.BindAddress
 	}
 
+	var webhookServer webhookserver.Server
+	if cfg.Controller.Webhook.Enabled {
+		webhookServer = webhookserver.NewServer(webhookserver.Options{
+			Port:    cfg.Controller.Webhook.Port,
+			CertDir: cfg.Controller.Webhook.CertDir,
+		})
+	}
+
 	mgr, err := ctrl.NewManager(kubeConfig, ctrl.Options{
-		Scheme: scheme,
+		Scheme:        scheme,
+		WebhookServer: webhookServer,
 		Metrics: metricsserver.Options{
 			BindAddress:    cfg.Controller.Metrics.BindAddress,
 			SecureServing:  true,
@@ -107,11 +121,18 @@ func New(
 	if err != nil {
 		return nil, fmt.Errorf("creating manager: %w", err)
 	}
+	if cfg.Controller.Webhook.Enabled {
+		mgr.GetWebhookServer()
+	}
 
 	if err := databaseservice.NewReconciler(ctx, mgr, cfg); err != nil {
 		return nil, fmt.Errorf("creating databaseservice reconciler: %w", err)
 	}
-	providerCRDAvailable, err := databaseProviderCRDAvailable(ctx, mgr.GetAPIReader())
+
+	reader := mgr.GetAPIReader()
+	log := ctrl.Log.WithName("manager")
+
+	providerCRDAvailable, err := crdAvailable(ctx, reader, infraApi.DatabaseProviderCRDName)
 	if err != nil {
 		return nil, fmt.Errorf("checking DatabaseProvider CRD: %w", err)
 	}
@@ -122,9 +143,22 @@ func New(
 			return nil, fmt.Errorf("creating databaseprovider reconciler: %w", err)
 		}
 	} else {
-		ctrl.Log.WithName("manager").Info(
-			"DatabaseProvider CRD is absent; provider reconciliation requires a restart after CRD installation",
-		)
+		log.Info("DatabaseProvider CRD is absent; provider reconciliation requires a restart after CRD installation")
+	}
+
+	// Claim watches DatabaseProvider, so both CRDs must be present.
+	claimCRDAvailable, err := crdAvailable(ctx, reader, infraApi.DatabaseClaimCRDName)
+	if err != nil {
+		return nil, fmt.Errorf("checking DatabaseClaim CRD: %w", err)
+	}
+	if claimCRDAvailable && providerCRDAvailable {
+		if err := databaseclaim.NewReconciler(ctx, mgr, cfg, databaseclaim.Options{
+			Recorder: mgr.GetEventRecorder(infraApi.DatabaseClaimResource),
+		}); err != nil {
+			return nil, fmt.Errorf("creating databaseclaim reconciler: %w", err)
+		}
+	} else {
+		log.Info("DatabaseClaim reconciliation skipped; requires claim and provider CRDs (restart after install)")
 	}
 
 	if err := mgr.AddHealthzCheck(healthCheckName, healthz.Ping); err != nil {
@@ -137,9 +171,9 @@ func New(
 	return mgr, nil
 }
 
-func databaseProviderCRDAvailable(ctx context.Context, reader client.Reader) (bool, error) {
+func crdAvailable(ctx context.Context, reader client.Reader, name string) (bool, error) {
 	crd := &apiextensionsv1.CustomResourceDefinition{}
-	err := reader.Get(ctx, client.ObjectKey{Name: infraApi.DatabaseProviderCRDName}, crd)
+	err := reader.Get(ctx, client.ObjectKey{Name: name}, crd)
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
