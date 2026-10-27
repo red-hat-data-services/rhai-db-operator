@@ -2,9 +2,23 @@ name: E2E
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.tekton/**'
+      - '.gitignore'
+      - '.golangci.yml'
+      - 'semgrep.yaml'
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.tekton/**'
+      - '.gitignore'
+      - '.golangci.yml'
+      - 'semgrep.yaml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
