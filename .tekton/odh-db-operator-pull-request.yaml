@@ -17,6 +17,17 @@ metadata:
   name: odh-db-operator-on-pull-request-{{pull_request_number}}
   namespace: rhoai-tenant
 spec:
+  taskRunSpecs:
+  - pipelineTaskName: rpms-signature-scan
+    stepSpecs:
+    - name: rpms-signature-scan
+      computeResources:
+        requests:
+          cpu: 2600m
+          memory: 512Mi
+        limits:
+          cpu: 2600m
+          memory: 512Mi
   params:
   - name: git-url
     value: '{{source_url}}'
