@@ -21,3 +21,27 @@ func IsPgError(err error, code string) bool {
 func IsUndefinedObject(err error) bool {
 	return IsPgError(err, pgerrcode.UndefinedObject)
 }
+
+// IsInvalidCatalogName reports whether err is SQLSTATE 3D000
+// (invalid_catalog_name) — typically a missing database.
+func IsInvalidCatalogName(err error) bool {
+	return IsPgError(err, pgerrcode.InvalidCatalogName)
+}
+
+// IsDuplicateDatabase reports whether err is SQLSTATE 42P04
+// (duplicate_database). Concurrent CREATE DATABASE races land here.
+func IsDuplicateDatabase(err error) bool {
+	return IsPgError(err, pgerrcode.DuplicateDatabase)
+}
+
+// IsDuplicateSchema reports whether err is SQLSTATE 42P06
+// (duplicate_schema). Concurrent CREATE SCHEMA races land here.
+func IsDuplicateSchema(err error) bool {
+	return IsPgError(err, pgerrcode.DuplicateSchema)
+}
+
+// IsDuplicateObject reports whether err is SQLSTATE 42710 (duplicate_object).
+// Concurrent CREATE ROLE races land here.
+func IsDuplicateObject(err error) bool {
+	return IsPgError(err, pgerrcode.DuplicateObject)
+}

@@ -39,6 +39,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault(KeyOperatorNS, DefaultOperatorNS)
 	v.SetDefault(KeyPlatformType, DefaultPlatformType)
 	v.SetDefault(KeyPlatformVersion, DefaultPlatformVersion)
+	v.SetDefault(KeyDefaultProviderName, DefaultProviderName)
 
 	v.SetDefault(KeyMetricsBindAddr, DefaultMetricsBindAddr)
 	v.SetDefault(KeyHealthBindAddr, DefaultHealthBindAddr)
@@ -49,9 +50,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault(KeyZapEncoder, DefaultZapEncoder)
 	v.SetDefault(KeyPprofEnabled, DefaultPprofEnabled)
 	v.SetDefault(KeyPprofBindAddr, "")
+	v.SetDefault(KeyWebhookEnabled, DefaultWebhookEnabled)
+	v.SetDefault(KeyWebhookPort, DefaultWebhookPort)
+	v.SetDefault(KeyWebhookCertDir, DefaultWebhookCertDir)
 
 	v.SetDefault(KeyDatabaseServiceRetryInterval, DefaultRetryInterval)
 	v.SetDefault(KeyDatabaseProviderRetryInterval, DefaultRetryInterval)
+	v.SetDefault(KeyDatabaseClaimRetryInterval, DefaultRetryInterval)
+	v.SetDefault(KeySchemaClaimRetryInterval, DefaultRetryInterval)
+	v.SetDefault(KeyGracePeriod, DefaultGracePeriod)
 	v.SetDefault("postgres-image", DefaultInternalPostgresImage)
 }
 

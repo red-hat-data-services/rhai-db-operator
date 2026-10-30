@@ -6,9 +6,81 @@ resources:
 - ../crd
 - ../rbac
 - ../manager
+- ../webhook
+- ../certmanager
+- ../prometheus
 - metrics_service.yaml
 
 patches:
 - path: manager_metrics_patch.yaml
   target:
     kind: Deployment
+- path: manager_metrics_cert_patch.yaml
+  target:
+    kind: Deployment
+- path: manager_webhook_patch.yaml
+  target:
+    kind: Deployment
+
+replacements:
+- source:
+    kind: ConfigMap
+    version: v1
+    name: metrics-server-ca
+    fieldPath: .metadata.name
+  targets:
+  - select:
+      kind: ServiceMonitor
+      group: monitoring.coreos.com
+      version: v1
+      name: metrics-monitor
+    fieldPaths:
+    - .spec.endpoints.0.tlsConfig.ca.configMap.name
+- source:
+    kind: Service
+    version: v1
+    name: webhook-service
+    fieldPath: .metadata.name
+  targets:
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - .spec.dnsNames.0
+    - .spec.dnsNames.1
+    options:
+      delimiter: '.'
+      index: 0
+- source:
+    kind: Service
+    version: v1
+    name: webhook-service
+    fieldPath: .metadata.namespace
+  targets:
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - .spec.dnsNames.0
+    - .spec.dnsNames.1
+    options:
+      delimiter: '.'
+      index: 1
+- source:
+    kind: Issuer
+    group: cert-manager.io
+    version: v1
+    name: selfsigned-issuer
+    fieldPath: .metadata.name
+  targets:
+  - select:
+      kind: Certificate
+      group: cert-manager.io
+      version: v1
+      name: serving-cert
+    fieldPaths:
+    - .spec.issuerRef.name

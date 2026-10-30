@@ -24,6 +24,8 @@ limitations under the License.
 package gvk
 
 import (
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	fwgvk "github.com/opendatahub-io/odh-platform-utilities/framework/cluster/gvk"
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 )
@@ -36,6 +38,8 @@ var (
 	Deployment                     = fwgvk.Deployment
 	ServiceAccount                 = fwgvk.ServiceAccount
 	ConfigMap                      = fwgvk.ConfigMap
+	Service                        = fwgvk.Service
+	ClusterRole                    = fwgvk.ClusterRole
 	ClusterRoleBinding             = fwgvk.ClusterRoleBinding
 	RoleBinding                    = fwgvk.RoleBinding
 	MutatingWebhookConfiguration   = fwgvk.MutatingWebhookConfiguration
@@ -43,9 +47,21 @@ var (
 	CertManagerIssuer              = fwgvk.CertManagerIssuer
 	CertManagerCertificate         = fwgvk.CertManagerCertificate
 	Secret                         = fwgvk.Secret
+	ServiceMonitor                 = schema.GroupVersionKind{
+		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+	}
 )
 
 var (
 	DatabaseProvider     = infraApi.SchemeGroupVersion.WithKind("DatabaseProvider")
 	DatabaseProviderList = infraApi.SchemeGroupVersion.WithKind("DatabaseProviderList")
+	DatabaseClaim        = infraApi.SchemeGroupVersion.WithKind("DatabaseClaim")
+	SchemaClaim          = infraApi.SchemeGroupVersion.WithKind("SchemaClaim")
+
+	// SecurityContextConstraints is the OpenShift SCC kind. Absent on Kind.
+	SecurityContextConstraints = schema.GroupVersionKind{
+		Group:   "security.openshift.io",
+		Version: "v1",
+		Kind:    "SecurityContextConstraints",
+	}
 )

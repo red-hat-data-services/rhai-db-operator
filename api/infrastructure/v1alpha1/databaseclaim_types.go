@@ -52,11 +52,22 @@ type DatabaseConnectionStatus struct {
 }
 
 // DatabaseClaimSpec defines the desired state of DatabaseClaim.
+//
+// Field-level self == oldSelf rules do not run when an optional field is
+// removed or when it is first added; these Spec-level presence rules close
+// both gaps so a field cannot be cleared or introduced after create (same
+// pattern as SchemaClaimSpec).
+//
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.secretName) == has(self.secretName)",message="secretName cannot be added or removed after claim creation"
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.database) == has(self.database)",message="database cannot be added or removed after claim creation"
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.extensions) == has(self.extensions)",message="extensions cannot be added or removed after claim creation"
+// +kubebuilder:validation:XValidation:rule="(!has(oldSelf.provider) || (!has(oldSelf.provider.name) && !has(oldSelf.provider.selector))) == (!has(self.provider) || (!has(self.provider.name) && !has(self.provider.selector)))",message="provider selection cannot be added or removed after claim creation"
 type DatabaseClaimSpec struct {
-	// Provider selects the DatabaseProvider to provision against.
-	// +kubebuilder:validation:Required
+	// Provider selects the DatabaseProvider to provision against. Omission
+	// selects the DatabaseService default provider.
+	// +optional
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="provider is immutable once set"
-	Provider ProviderRef `json:"provider"`
+	Provider ProviderRef `json:"provider,omitempty"`
 
 	// SecretName overrides the name of the credentials Secret projected in the
 	// claim namespace. If omitted, the claim name is used. Immutable once set so
@@ -75,6 +86,7 @@ type DatabaseClaimSpec struct {
 	// different claim, not an update to this one.
 	//
 	// +optional
+	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="database is immutable once set"
 	Database string `json:"database,omitempty"`
 
@@ -83,21 +95,42 @@ type DatabaseClaimSpec struct {
 	// +kubebuilder:default=ReadWrite
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="access is immutable once set"
 	Access AccessMode `json:"access,omitempty"`
+
+	// Extensions lists PostgreSQL extensions this claim requires in its target
+	// database. Day-one allow-list is vector only. Immutable once set.
+	//
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Enum=vector
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="extensions are immutable once set"
+	Extensions []string `json:"extensions,omitempty"`
+
+	// DeletionPolicy governs database lifecycle on claim deletion. Retain
+	// (default) drops only the claim role; Delete may drop a named database
+	// the claim created, but never the provider's shared default database.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +kubebuilder:default=Retain
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
-// DatabaseClaimStatus defines the observed state of DatabaseClaim. There is
-// no deletionPolicy field on the spec, so there is no corresponding status
-// concern either -- always-Retain semantics (docs/plan.md §5). Phase (human-
-// readable summary only -- consumers must gate on conditions[type=Provisioned],
-// never on Phase) comes from the embedded common.Status, not a redundant
-// field here.
+// DatabaseClaimStatus defines the observed state of DatabaseClaim. Phase
+// (human-readable summary only -- consumers must gate on
+// conditions[type=Provisioned], never on Phase) comes from the embedded
+// common.Status, not a redundant field here.
 type DatabaseClaimStatus struct {
 	fwapi.Status                  `json:",inline"`
 	common.ComponentReleaseStatus `json:",inline"`
 
-	// Database echoes spec.database exactly -- always identical, no default
-	// to resolve here (unlike SchemaClaim.status.schema).
+	// Database is the effective database name once provisioning resolves it:
+	// spec.database when set, otherwise the provider default.
 	Database string `json:"database,omitempty"`
+
+	// DatabaseCreated is true when this claim created the named database during
+	// provisioning. DeletionPolicy=Delete may drop the database only when this
+	// is true (and no other DatabaseClaim still references it).
+	// +optional
+	DatabaseCreated bool `json:"databaseCreated,omitempty"`
 
 	// Connection is the resolved connection surface once Provisioned,
 	// including the effective credentials Secret name.

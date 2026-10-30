@@ -21,12 +21,15 @@ import (
 	"errors"
 	"fmt"
 
-	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
+	"github.com/opendatahub-io/odh-platform-utilities/framework/controller/conditions"
+	odhtypes "github.com/opendatahub-io/odh-platform-utilities/framework/controller/types"
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	dbcontroller "github.com/opendatahub-io/opendatahub-db-operator/pkg/controller"
+	dbmetrics "github.com/opendatahub-io/opendatahub-db-operator/pkg/metrics"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/postgres"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -64,13 +67,16 @@ func (e ErrConnectionSecretInvalid) Error() string {
 }
 func (e ErrConnectionSecretInvalid) Unwrap() error { return e.Cause }
 
-func loadExternalConfig(ctx context.Context, cli client.Client, provider *infraApi.DatabaseProvider) (postgres.Config, error) {
+// loadExternalConfig must receive the manager's API reader: administrator
+// Secrets carry no operator label and never enter the label-scoped cache
+// (RHOAIENG-96275).
+func loadExternalConfig(ctx context.Context, reader client.Reader, provider *infraApi.DatabaseProvider) (postgres.Config, error) {
 	if provider.Spec.External == nil {
 		return postgres.Config{}, ErrConnectionSecretInvalid{Name: provider.Name, Cause: fmt.Errorf("spec.external is required for External providers")}
 	}
 	ref := provider.Spec.External.ConnectionSecretRef
 	secret := &corev1.Secret{}
-	if err := cli.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
 		return postgres.Config{}, ErrConnectionSecretUnavailable{Ref: ref, Cause: err}
 	}
 	cfg, err := postgres.ParseAdminSecret(secret.Data)
@@ -101,6 +107,16 @@ func externalFailureReason(err error) string {
 
 func providerConnectionStatus(cfg postgres.Config) infraApi.ProviderConnectionStatus {
 	return infraApi.ProviderConnectionStatus{Host: cfg.Host, Port: int32(cfg.Port), Database: cfg.DBName}
+}
+
+func markReachable(
+	rr *odhtypes.ReconciliationRequest,
+	provider *infraApi.DatabaseProvider,
+	status metav1.ConditionStatus,
+	opts ...conditions.Option,
+) {
+	rr.Conditions.Mark(ConditionReachable, status, opts...)
+	dbmetrics.SetProviderReachable(provider.Name, status == metav1.ConditionTrue)
 }
 
 const (

@@ -43,6 +43,13 @@ const (
 
 	tplReleaseNamespace   = "namespace: {{ .Release.Namespace }}"
 	tplServiceAccountName = `{{ default (include "chart.fullname" .) .Values.serviceAccount.name }}`
+	tplChartFullname      = `{{ include "chart.fullname" . }}`
+	serviceCAGate         = `or .Values.openshift.serviceCA ` +
+		`(.Capabilities.APIVersions.Has "security.openshift.io/v1")`
+	serviceMonitorGate         = `{{- if and .Values.monitoring.serviceMonitor.enabled (` + serviceCAGate + `) }}`
+	metricsReaderRoleName      = "odh-db-operator-metrics-reader"
+	serviceCAAnnotation        = "service.beta.openshift.io/inject-cabundle"
+	serviceCAServingAnnotation = "service.beta.openshift.io/serving-cert-secret-name"
 
 	annotationCertManagerInjectCAFrom = "cert-manager.io/inject-ca-from"
 
@@ -57,9 +64,17 @@ const (
 	// find and replace them by exact value rather than by guessing which
 	// "image:"/"imagePullPolicy:" line in the whole Deployment belongs to
 	// the operator's own container.
-	imagePlaceholder      = "__CHARTGEN_MANAGER_IMAGE__"
-	pullPolicyPlaceholder = "__CHARTGEN_MANAGER_PULL_POLICY__"
-	resourcesPlaceholder  = "__CHARTGEN_MANAGER_RESOURCES__"
+	imagePlaceholder          = "__CHARTGEN_MANAGER_IMAGE__"
+	pullPolicyPlaceholder     = "__CHARTGEN_MANAGER_PULL_POLICY__"
+	resourcesPlaceholder      = "__CHARTGEN_MANAGER_RESOURCES__"
+	webhookServerPortName     = "webhook-server"
+	webhookCertVolumeName     = "cert"
+	webhookPortPlaceholder    = "__CHARTGEN_WEBHOOK_PORT__"
+	webhookCertDirPlaceholder = "__CHARTGEN_WEBHOOK_CERT_DIR__"
+	webhookCertDirDefault     = "/tmp/k8s-webhook-server/serving-certs"
+	tplWebhookPort            = `{{ default 9443 (int (index .Values.config "controller.webhook.port")) }}`
+	tplWebhookCertDir         = `{{ default "` + webhookCertDirDefault +
+		`" (index .Values.config "controller.webhook.cert-dir") | quote }}`
 
 	// Sentinel values stamped onto a RoleBinding/ClusterRoleBinding subject
 	// that's been structurally confirmed to be the operator's own
@@ -140,7 +155,28 @@ func renderGroup(
 		parts = append(parts, transformed)
 	}
 
-	return strings.Join(parts, "\n---\n"), nil
+	content := strings.Join(parts, "\n---\n")
+	if resourceGVK == gvk.SecurityContextConstraints {
+		// Kind and vanilla Kubernetes lack this API; skip at install time.
+		return wrapOpenShiftAPIGuard(content), nil
+	}
+	return content, nil
+}
+
+// wrapOpenShiftAPIGuard renders the content when either the OpenShift SCC API
+// is discoverable (standalone helm install/upgrade against a live cluster) or
+// Values.openshift.securityContextConstraints is true.
+//
+// The ODH platform operator renders charts offline via renderer-helm with
+// nil Capabilities (DefaultCapabilities only), so Capabilities alone would
+// skip the SCC on OpenShift. Module handlers set the Values flag for that path.
+func wrapOpenShiftAPIGuard(content string) string {
+	const (
+		begin = "{{- if or .Values.openshift.securityContextConstraints" +
+			" (.Capabilities.APIVersions.Has \"security.openshift.io/v1\") }}\n"
+		end = "\n{{- end }}\n"
+	)
+	return begin + content + end
 }
 
 var stripLabelKeys = []string{
@@ -222,13 +258,24 @@ func transformResource(
 		// .Values.platform.*/.Values.config templating meant for a
 		// different ConfigMap entirely. Namespace-qualified: a same-named
 		// ConfigMap in some other namespace is a different object.
+		if hasAnnotation(obj, serviceCAAnnotation) {
+			return transformServiceCAConfigMap(obj)
+		}
 		return transformGeneric(obj)
-	case gvk.ClusterRoleBinding, gvk.RoleBinding:
+	case gvk.ClusterRole:
+		return transformClusterRole(obj)
+	case gvk.ClusterRoleBinding:
+		return transformClusterRoleBinding(obj, chartCtx.operatorServiceAccount, chartCtx.operatorServiceAccountManaged)
+	case gvk.RoleBinding:
 		return transformRoleBinding(obj, chartCtx.operatorServiceAccount, chartCtx.operatorServiceAccountManaged)
 	case gvk.MutatingWebhookConfiguration, gvk.ValidatingWebhookConfiguration:
 		return transformWebhook(obj)
 	case gvk.CertManagerCertificate:
 		return transformCertificate(obj)
+	case gvk.ServiceMonitor:
+		return transformServiceMonitor(obj)
+	case gvk.Service:
+		return transformService(obj)
 	default:
 		return transformGeneric(obj)
 	}
@@ -263,14 +310,17 @@ func rewriteOperatorConfigMapName(
 	return unstructured.SetNestedSlice(obj.Object, volumes, "spec", "template", "spec", "volumes")
 }
 
-// transformDeployment injects Helm value references for image, resources,
-// replicas, imagePullSecrets, and serviceAccountName.
+// transformDeployment injects Helm value references for the manager image,
+// resources, webhook settings, replicas, imagePullSecrets, and serviceAccountName.
 func transformDeployment(
 	obj *unstructured.Unstructured,
 	hasOperatorConfigMap bool,
 	hasChartManagedServiceAccount bool,
 ) (string, error) {
 	if err := stampManagerContainerPlaceholders(obj); err != nil {
+		return "", fmt.Errorf("deployment %s: %w", obj.GetName(), err)
+	}
+	if err := stampWebhookPlaceholders(obj); err != nil {
 		return "", fmt.Errorf("deployment %s: %w", obj.GetName(), err)
 	}
 
@@ -316,6 +366,8 @@ func transformDeployment(
 	raw = replaceReplicas(raw)
 
 	raw = replaceResourcesField(raw)
+	raw = strings.ReplaceAll(raw, webhookPortPlaceholder, tplWebhookPort)
+	raw = strings.ReplaceAll(raw, webhookCertDirPlaceholder, tplWebhookCertDir)
 
 	// Replace serviceAccountName. hasChartManagedServiceAccount gates
 	// whether the field was stamped with a sentinel above at all -- when
@@ -425,6 +477,65 @@ func stampManagerContainerPlaceholders(obj *unstructured.Unstructured) error {
 	return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
 }
 
+func stampWebhookPlaceholders(obj *unstructured.Unstructured) error {
+	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		return fmt.Errorf("reading spec.template.spec.containers: %w", err)
+	}
+	if !found {
+		return nil
+	}
+
+	container, ok := findManagerContainer(containers)
+	if !ok {
+		return fmt.Errorf("no container named %q", managerContainerName)
+	}
+
+	ports, found, err := unstructured.NestedSlice(container, "ports")
+	if err != nil {
+		return fmt.Errorf("reading manager container ports: %w", err)
+	}
+	if found {
+		for _, item := range ports {
+			port, ok := item.(map[string]any)
+			if !ok || port["name"] != webhookServerPortName {
+				continue
+			}
+			if _, found := port["containerPort"]; !found {
+				return fmt.Errorf("manager port %q has no containerPort", webhookServerPortName)
+			}
+			port["containerPort"] = webhookPortPlaceholder
+			break
+		}
+		if err := unstructured.SetNestedSlice(container, ports, "ports"); err != nil {
+			return fmt.Errorf("stamping manager webhook port: %w", err)
+		}
+	}
+
+	volumeMounts, found, err := unstructured.NestedSlice(container, "volumeMounts")
+	if err != nil {
+		return fmt.Errorf("reading manager container volume mounts: %w", err)
+	}
+	if found {
+		for _, item := range volumeMounts {
+			volumeMount, ok := item.(map[string]any)
+			if !ok || volumeMount["name"] != webhookCertVolumeName {
+				continue
+			}
+			if _, found := volumeMount["mountPath"]; !found {
+				return fmt.Errorf("manager volume mount %q has no mountPath", webhookCertVolumeName)
+			}
+			volumeMount["mountPath"] = webhookCertDirPlaceholder
+			break
+		}
+		if err := unstructured.SetNestedSlice(container, volumeMounts, "volumeMounts"); err != nil {
+			return fmt.Errorf("stamping manager webhook certificate directory: %w", err)
+		}
+	}
+
+	return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+}
+
 // transformServiceAccount injects Helm value references for the name and
 // annotations, and always creates the ServiceAccount.
 func transformServiceAccount(obj *unstructured.Unstructured) (string, error) {
@@ -502,6 +613,21 @@ func transformRoleBinding(
 	operatorServiceAccount types.NamespacedName,
 	renameManaged bool,
 ) (string, error) {
+	roleRef, found, err := unstructured.NestedMap(obj.Object, "roleRef")
+	if err != nil {
+		return "", fmt.Errorf("reading roleRef: %w", err)
+	}
+	if found {
+		roleName, _ := roleRef["name"].(string)
+		roleKind, _ := roleRef["kind"].(string)
+		if roleKind == "ClusterRole" && strings.HasPrefix(roleName, "odh-db-operator-") {
+			roleRef["name"] = releaseScopedName(roleName)
+			if err := unstructured.SetNestedMap(obj.Object, roleRef, "roleRef"); err != nil {
+				return "", err
+			}
+		}
+	}
+
 	if err := stampOperatorSubjectPlaceholders(obj, operatorServiceAccount, renameManaged); err != nil {
 		return "", fmt.Errorf("role binding %s: %w", obj.GetName(), err)
 	}
@@ -515,6 +641,85 @@ func transformRoleBinding(
 	raw = replaceSubjectPlaceholders(raw)
 
 	return raw, nil
+}
+
+func releaseScopedName(name string) string {
+	suffix := strings.TrimPrefix(name, "odh-db-operator-")
+	return fmt.Sprintf(
+		`{{ include "chart.clusterResourceName" (dict "root" . "suffix" %q) }}`,
+		suffix,
+	)
+}
+
+func transformClusterRole(obj *unstructured.Unstructured) (string, error) {
+	name := obj.GetName()
+	if strings.HasPrefix(name, "odh-db-operator-") {
+		obj.SetName(releaseScopedName(name))
+	}
+	return transformGeneric(obj)
+}
+
+func transformClusterRoleBinding(
+	obj *unstructured.Unstructured,
+	operatorServiceAccount types.NamespacedName,
+	renameManaged bool,
+) (string, error) {
+	roleRef, found, err := unstructured.NestedMap(obj.Object, "roleRef")
+	if err != nil {
+		return "", fmt.Errorf("reading roleRef: %w", err)
+	}
+	if !found {
+		return "", fmt.Errorf("roleRef is missing")
+	}
+	roleName, _ := roleRef["name"].(string)
+	metricsReaderBinding := strings.HasSuffix(roleName, "-metrics-reader")
+	if roleName != "" {
+		roleRef["name"] = releaseScopedName(roleName)
+		if err := unstructured.SetNestedMap(obj.Object, roleRef, "roleRef"); err != nil {
+			return "", err
+		}
+	}
+
+	if err := stampOperatorSubjectPlaceholders(obj, operatorServiceAccount, renameManaged); err != nil {
+		return "", fmt.Errorf("role binding %s: %w", obj.GetName(), err)
+	}
+
+	if metricsReaderBinding {
+		if err := configureCollectorSubject(obj); err != nil {
+			return "", err
+		}
+	}
+
+	obj.SetName(releaseScopedName(obj.GetName()))
+	raw, err := marshalResource(obj)
+	if err != nil {
+		return "", err
+	}
+
+	raw = replaceNamespace(raw)
+	raw = replaceSubjectPlaceholders(raw)
+	return raw, nil
+}
+
+func configureCollectorSubject(obj *unstructured.Unstructured) error {
+	subjects, found, err := unstructured.NestedSlice(obj.Object, "subjects")
+	if err != nil {
+		return fmt.Errorf("reading subjects: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("subjects are missing")
+	}
+
+	for _, item := range subjects {
+		subject, ok := item.(map[string]any)
+		if !ok || subject["kind"] != "ServiceAccount" {
+			continue
+		}
+		subject["name"] = "{{ .Values.monitoring.serviceMonitor.collector.serviceAccount.name }}"
+		subject["namespace"] = "{{ .Values.monitoring.serviceMonitor.collector.serviceAccount.namespace }}"
+	}
+
+	return unstructured.SetNestedSlice(obj.Object, subjects, "subjects")
 }
 
 // stampOperatorSubjectPlaceholders overwrites the namespace (always, when
@@ -708,6 +913,88 @@ func transformGeneric(obj *unstructured.Unstructured) (string, error) {
 	}
 
 	return raw, nil
+}
+
+func transformServiceMonitor(obj *unstructured.Unstructured) (string, error) {
+	raw, err := transformGeneric(obj)
+	if err != nil {
+		return "", err
+	}
+
+	raw = replaceServiceMonitorServerName(raw)
+
+	return serviceMonitorGate + "\n" + raw + "\n{{- end }}", nil
+}
+
+func hasAnnotation(obj *unstructured.Unstructured, key string) bool {
+	_, found := obj.GetAnnotations()[key]
+	return found
+}
+
+func transformServiceCAConfigMap(obj *unstructured.Unstructured) (string, error) {
+	raw, err := transformGeneric(obj)
+	if err != nil {
+		return "", err
+	}
+
+	return "{{- if " + serviceCAGate + " }}\n" + raw + "\n{{- end }}", nil
+}
+
+func transformService(obj *unstructured.Unstructured) (string, error) {
+	raw, err := transformGeneric(obj)
+	if err != nil {
+		return "", err
+	}
+	if !hasAnnotation(obj, serviceCAServingAnnotation) {
+		return raw, nil
+	}
+
+	return gateServiceAnnotation(raw), nil
+}
+
+func gateServiceAnnotation(raw string) string {
+	lines := strings.Split(raw, "\n")
+	for index, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), serviceCAServingAnnotation+":") {
+			continue
+		}
+
+		indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+		gated := []string{
+			indent + "{{- if " + serviceCAGate + " }}",
+			line,
+			indent + "{{- end }}",
+		}
+		lines = append(lines[:index], append(gated, lines[index+1:]...)...)
+		return strings.Join(lines, "\n")
+	}
+	return raw
+}
+
+// replaceServiceMonitorServerName replaces the namespace segment in
+// tlsConfig.serverName with the Helm release namespace template.
+// serverName follows the pattern: <service>.<namespace>.svc[.cluster.local]
+func replaceServiceMonitorServerName(raw string) string {
+	lines := strings.Split(raw, "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if !strings.HasPrefix(trimmed, "serverName: ") || !strings.Contains(trimmed, ".svc") {
+			continue
+		}
+
+		value := strings.TrimPrefix(trimmed, "serverName: ")
+		parts := strings.SplitN(value, ".", 3)
+		if len(parts) < 3 {
+			continue
+		}
+
+		indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+		lines[i] = indent + "serverName: " + parts[0] + ".{{ .Release.Namespace }}." + parts[2]
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 // marshalResource marshals an unstructured resource to YAML.

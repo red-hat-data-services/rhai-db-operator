@@ -77,7 +77,20 @@ func (m *Controller) reconcileInternalAction(
 	}
 
 	markInternalTLSConfiguration(rr, tlsState, nil)
-	return m.addInternalResources(ctx, rr, obj, tlsState)
+
+	// Discover SCC once and share the result so Ensure and RoleBinding cannot
+	// disagree within the same reconcile.
+	sccAvailable, err := dbcontroller.SecurityContextConstraintsAvailable(rr.Client)
+	if err != nil {
+		return fmt.Errorf("checking SecurityContextConstraints API: %w", err)
+	}
+	// On OpenShift the install-time SCC must already exist before the
+	// StatefulSet is admitted. The reconciler verifies; it does not create.
+	if err := dbcontroller.EnsureInternalPostgresSCC(ctx, rr.Client, sccAvailable); err != nil {
+		return fmt.Errorf("ensuring Internal Postgres SCC: %w", err)
+	}
+
+	return m.addInternalResources(ctx, rr, obj, tlsState, sccAvailable)
 }
 
 func (m *Controller) reportInternalAdminSecretFailure(
@@ -87,7 +100,7 @@ func (m *Controller) reportInternalAdminSecretFailure(
 	err error,
 ) error {
 	obj.Status.Connection = infraApi.ProviderConnectionStatus{}
-	rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+	markReachable(rr, obj, metav1.ConditionFalse,
 		conditions.WithReason(reasonAdminSecretUnavailable),
 		conditions.WithMessagef("%s", err.Error()))
 	markInternalTLSConfiguration(rr, tlsState, err)
@@ -132,6 +145,7 @@ func (m *Controller) addInternalResources(
 	rr *odhtypes.ReconciliationRequest,
 	obj *infraApi.DatabaseProvider,
 	tlsState TLSState,
+	sccAvailable bool,
 ) error {
 	data, err := resolveInternalData(ctx, rr.Client, obj, m.cfg, tlsState)
 	if err != nil {
@@ -149,6 +163,17 @@ func (m *Controller) addInternalResources(
 		}
 		if err := rr.AddResources(&pgres[i]); err != nil {
 			return fmt.Errorf("adding internal resources: %w", err)
+		}
+	}
+
+	if sccAvailable {
+		binding := dbcontroller.DesiredInternalPostgresSCCRoleBinding(
+			data.Namespace,
+			data.ServiceAccountName,
+			obj.Name,
+		)
+		if err := rr.AddResources(binding); err != nil {
+			return fmt.Errorf("adding Internal Postgres SCC RoleBinding: %w", err)
 		}
 	}
 
@@ -173,7 +198,7 @@ func (m *Controller) internalReadinessAction(
 
 	if err := rr.Client.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
 		if apierrors.IsNotFound(err) {
-			rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+			markReachable(rr, obj, metav1.ConditionFalse,
 				conditions.WithReason(reasonProvisioning),
 				conditions.WithMessage("Waiting for internal PostgreSQL resources"))
 			return nil
@@ -182,20 +207,20 @@ func (m *Controller) internalReadinessAction(
 	}
 
 	if sts.Status.ReadyReplicas != pginstance.InternalPostgresReplicaCount {
-		rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+		markReachable(rr, obj, metav1.ConditionFalse,
 			conditions.WithReason(reasonProvisioning),
 			conditions.WithMessage("Waiting for internal PostgreSQL StatefulSet to become ready"))
 		return nil
 	}
 	cfg, err := dbcontroller.LoadProviderConfig(ctx, rr.Client, obj, m.cfg.OperatorNamespace)
 	if err != nil {
-		rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+		markReachable(rr, obj, metav1.ConditionFalse,
 			conditions.WithReason(reasonAdminSecretUnavailable),
 			conditions.WithMessagef("Loading internal admin Secret: %s", err))
 		return nil
 	}
 	if err := m.probeInternalAdminConnection(ctx, cfg); err != nil {
-		rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+		markReachable(rr, obj, metav1.ConditionFalse,
 			conditions.WithReason("AdminConnectionFailed"),
 			conditions.WithMessagef(
 				"Internal PostgreSQL admin connection failed: %s. Verify the admin Secret, TLS, and network access.",
@@ -204,7 +229,7 @@ func (m *Controller) internalReadinessAction(
 		return nil
 	}
 
-	rr.Conditions.Mark(ConditionReachable, metav1.ConditionTrue,
+	markReachable(rr, obj, metav1.ConditionTrue,
 		conditions.WithReason(reasonInstanceRunning),
 		conditions.WithMessage("Internal PostgreSQL instance is ready"))
 
