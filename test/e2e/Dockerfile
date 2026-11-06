@@ -47,7 +47,7 @@ RUN helm_archive="/cachi2/output/deps/generic/helm-v${HELM_VERSION}-${TARGETOS}-
 
 FROM --platform=$TARGETPLATFORM ${BASE_IMAGE}
 ARG USER_ID=65532
-ARG ODH_E2E_OPERATOR_IMAGE=quay.io/rhoai/odh-db-operator-rhel9:latest
+ARG ODH_E2E_OPERATOR_IMAGE=quay.io/rhoai/odh-db-operator-rhel9:rhoai-3.7-ea.1
 ENV ODH_E2E_OPERATOR_IMAGE=${ODH_E2E_OPERATOR_IMAGE}
 WORKDIR /e2e
 
