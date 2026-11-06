@@ -1,0 +1,128 @@
+name: E2E
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.tekton/**'
+      - '.gitignore'
+      - '.golangci.yml'
+      - 'semgrep.yaml'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.tekton/**'
+      - '.gitignore'
+      - '.golangci.yml'
+      - 'semgrep.yaml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CALICO_VERSION: v3.29.5
+
+jobs:
+  e2e:
+    name: Cert-manager ${{ matrix.cert-manager-profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        cert-manager-profile: [present, absent]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned tools from Makefile
+        run: |
+          echo "CERT_MANAGER_VERSION=$(make print-cert-manager-version)" >> "$GITHUB_ENV"
+          echo "KIND_VERSION=$(make print-kind-version)" >> "$GITHUB_ENV"
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: db-operator-e2e-${{ matrix.cert-manager-profile }}
+          version: ${{ env.KIND_VERSION }}
+          wait: 5m
+
+      - name: Install cert-manager
+        if: matrix.cert-manager-profile == 'present'
+        run: |
+          make helm-tool
+          ./bin/helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+            --version "$CERT_MANAGER_VERSION" --namespace cert-manager --create-namespace \
+            --set crds.enabled=true --wait --timeout 5m
+
+      - name: Provision external PostgreSQL target
+        run: bash test/e2e/scripts/setup-external-postgres.sh "db-operator-e2e-${{ matrix.cert-manager-profile }}"
+
+      - name: Run provider lifecycles
+        run: |
+          make test-e2e-providers \
+            KIND_CLUSTER="db-operator-e2e-${{ matrix.cert-manager-profile }}" \
+            CONTAINER_TOOL=docker \
+            E2E_CERT_MANAGER_PROFILE="${{ matrix.cert-manager-profile }}" \
+            E2E_EXTERNAL_ADMIN_SECRET_NAMESPACE=external-postgres \
+            E2E_EXTERNAL_ADMIN_SECRET_NAME=external-postgres-admin
+
+  baseline:
+    name: Default-deny baseline (Calico)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned tools from Makefile
+        run: |
+          make helm-tool
+          echo "CERT_MANAGER_VERSION=$(make print-cert-manager-version)" >> "$GITHUB_ENV"
+          echo "KIND_VERSION=$(make print-kind-version)" >> "$GITHUB_ENV"
+
+      - name: Create Kind cluster with Calico
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: db-operator-e2e-baseline
+          version: ${{ env.KIND_VERSION }}
+          config: test/e2e/scripts/kind-calico-config.yaml
+          wait: 5m
+
+      - name: Install Calico
+        run: |
+          kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
+          # With the default CNI disabled the nodes stay NotReady until a
+          # CNI is functional, so waiting on nodes gates on Calico actually
+          # working; waiting on pods directly would race their creation.
+          if ! kubectl wait --for=condition=Ready node --all --timeout=5m; then
+            kubectl get pods -A -o wide || true
+            kubectl -n kube-system describe pod -l k8s-app=calico-node || true
+            exit 1
+          fi
+
+      - name: Install cert-manager
+        run: |
+          ./bin/helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+            --version "$CERT_MANAGER_VERSION" --namespace cert-manager --create-namespace \
+            --set crds.enabled=true --wait --timeout 5m
+
+      - name: Run default-deny baseline scenario
+        run: |
+          make test-e2e-setup KIND_CLUSTER=db-operator-e2e-baseline E2E_CERT_MANAGER_PROFILE=present
+          ODH_E2E_NAMESPACE=opendatahub-db-operator-e2e             go test ./test/e2e/ -run TestOperatorRunsUnderDefaultDenyBaseline -v -count=1 -timeout 25m
+
+      - name: Teardown
+        if: always()
+        run: make test-e2e-teardown KIND_CLUSTER=db-operator-e2e-baseline || true
