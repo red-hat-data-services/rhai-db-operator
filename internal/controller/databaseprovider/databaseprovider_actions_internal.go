@@ -48,6 +48,10 @@ func (m *Controller) reconcileInternalAction(
 	if obj.Spec.Type != infraApi.ProviderTypeInternal {
 		return nil
 	}
+	rr.Conditions.Mark(infraApi.ConditionOperationalLimitations, metav1.ConditionTrue,
+		conditions.WithSeverity(api.ConditionSeverityInfo),
+		conditions.WithReason("SingleInstanceWithoutBackup"),
+		conditions.WithMessage("The Internal provider is a single PostgreSQL instance without high availability or automated backup and restore. Use an appropriately managed External provider when those capabilities are required."))
 	if internalTLSEnabled(obj) {
 		available, err := dbcontroller.CertManagerAvailable(ctx, rr.Client)
 		if err != nil {
@@ -100,7 +104,7 @@ func (m *Controller) reportInternalAdminSecretFailure(
 	err error,
 ) error {
 	obj.Status.Connection = infraApi.ProviderConnectionStatus{}
-	rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+	markReachable(rr, obj, metav1.ConditionFalse,
 		conditions.WithReason(reasonAdminSecretUnavailable),
 		conditions.WithMessagef("%s", err.Error()))
 	markInternalTLSConfiguration(rr, tlsState, err)
@@ -198,7 +202,7 @@ func (m *Controller) internalReadinessAction(
 
 	if err := rr.Client.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
 		if apierrors.IsNotFound(err) {
-			rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+			markReachable(rr, obj, metav1.ConditionFalse,
 				conditions.WithReason(reasonProvisioning),
 				conditions.WithMessage("Waiting for internal PostgreSQL resources"))
 			return nil
@@ -207,29 +211,30 @@ func (m *Controller) internalReadinessAction(
 	}
 
 	if sts.Status.ReadyReplicas != pginstance.InternalPostgresReplicaCount {
-		rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+		markReachable(rr, obj, metav1.ConditionFalse,
 			conditions.WithReason(reasonProvisioning),
 			conditions.WithMessage("Waiting for internal PostgreSQL StatefulSet to become ready"))
 		return nil
 	}
 	cfg, err := dbcontroller.LoadProviderConfig(ctx, rr.Client, obj, m.cfg.OperatorNamespace)
 	if err != nil {
-		rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+		markReachable(rr, obj, metav1.ConditionFalse,
 			conditions.WithReason(reasonAdminSecretUnavailable),
 			conditions.WithMessagef("Loading internal admin Secret: %s", err))
 		return nil
 	}
+	cfg = m.cfg.WithPostgresTracing(cfg)
 	if err := m.probeInternalAdminConnection(ctx, cfg); err != nil {
-		rr.Conditions.Mark(ConditionReachable, metav1.ConditionFalse,
+		markReachable(rr, obj, metav1.ConditionFalse,
 			conditions.WithReason("AdminConnectionFailed"),
 			conditions.WithMessagef(
 				"Internal PostgreSQL admin connection failed: %s. Verify the admin Secret, TLS, and network access.",
-				postgres.SanitizeError(err, cfg.Password),
+				err,
 			))
 		return nil
 	}
 
-	rr.Conditions.Mark(ConditionReachable, metav1.ConditionTrue,
+	markReachable(rr, obj, metav1.ConditionTrue,
 		conditions.WithReason(reasonInstanceRunning),
 		conditions.WithMessage("Internal PostgreSQL instance is ready"))
 

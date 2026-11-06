@@ -136,6 +136,10 @@ func TestDatabaseServiceCreatesDefaultProvider(t *testing.T) {
 		g.Expect(cli.Get(ctx, client.ObjectKey{Name: cfg.DefaultProviderName}, provider)).To(Succeed())
 		g.Expect(provider.Spec.Type).To(Equal(infraApi.ProviderTypeInternal))
 		g.Expect(provider.Spec.Internal.Storage.Size.String()).To(Equal("20Gi"))
+		limit := conditions.FindStatusCondition(provider, infraApi.ConditionOperationalLimitations)
+		g.Expect(limit).NotTo(BeNil())
+		g.Expect(limit.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(limit.Severity).To(Equal(fwapi.ConditionSeverityInfo))
 		statefulSet := &appsv1.StatefulSet{}
 		key := client.ObjectKey{Namespace: cfg.OperatorNamespace, Name: cfg.DefaultProviderName}
 		g.Expect(cli.Get(ctx, key, statefulSet)).To(Succeed())
@@ -191,6 +195,7 @@ func TestDatabaseServiceCreatesDefaultProvider(t *testing.T) {
 		g.Expect(reachable.Reason).To(Equal("ConnectionSecretUnavailable"))
 		g.Expect(reachable.Message).To(ContainSubstring("missing-admin"))
 		g.Expect(got.Status.ServerVersion).To(BeEmpty())
+		g.Expect(conditions.FindStatusCondition(got, infraApi.ConditionOperationalLimitations)).To(BeNil())
 	}).Should(Succeed())
 
 	g.Expect(cli.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "database-system"}})).To(Succeed())
@@ -261,17 +266,18 @@ func TestDatabaseServiceCreatesDefaultProvider(t *testing.T) {
 			return cli.Update(ctx, claim)
 		}).Should(Succeed())
 	}
+	reader := mgr.GetAPIReader()
 	g.Eventually(func(g Gomega) {
-		err := cli.Get(ctx, client.ObjectKey{Name: cfg.DefaultProviderName}, &infraApi.DatabaseProvider{})
+		err := reader.Get(ctx, client.ObjectKey{Name: cfg.DefaultProviderName}, &infraApi.DatabaseProvider{})
 		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "default provider should be removed after claims")
-		err = cli.Get(ctx, client.ObjectKeyFromObject(instance), &servicesv1alpha1.DatabaseService{})
+		err = reader.Get(ctx, client.ObjectKeyFromObject(instance), &servicesv1alpha1.DatabaseService{})
 		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "DatabaseService should finish deleting")
 		for _, obj := range []client.Object{&corev1.PersistentVolumeClaim{}, &corev1.Secret{}} {
 			key := client.ObjectKey{Namespace: cfg.OperatorNamespace, Name: cfg.DefaultProviderName}
 			if _, ok := obj.(*corev1.Secret); ok {
 				key.Name += "-admin"
 			}
-			g.Expect(cli.Get(ctx, key, obj)).To(Succeed())
+			g.Expect(reader.Get(ctx, key, obj)).To(Succeed())
 			g.Expect(obj.GetOwnerReferences()).To(BeEmpty())
 		}
 	}).Should(Succeed())

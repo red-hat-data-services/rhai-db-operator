@@ -9,19 +9,27 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	. "github.com/onsi/gomega"
+	fwapi "github.com/opendatahub-io/odh-platform-utilities/framework/api"
+	"github.com/opendatahub-io/odh-platform-utilities/framework/controller/conditions"
+	odhtypes "github.com/opendatahub-io/odh-platform-utilities/framework/controller/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/yaml"
 
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	moduleconfig "github.com/opendatahub-io/opendatahub-db-operator/pkg/config"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/controller"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/controller/claimerrors"
+	dbmetrics "github.com/opendatahub-io/opendatahub-db-operator/pkg/metrics"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/postgres"
+	secretvalue "github.com/opendatahub-io/opendatahub-db-operator/pkg/secret"
 )
 
 func TestNewClient_LoadsProviderConfigAndUsesFactory(t *testing.T) {
@@ -75,12 +83,39 @@ func TestNewClient_LoadsProviderConfigAndUsesFactory(t *testing.T) {
 		Host:     "postgres.db-admin.svc",
 		Port:     postgres.DefaultPort,
 		User:     "postgres",
-		Password: "secret",
+		Password: secretvalue.FromString("secret"),
 		DBName:   "postgres",
 		SSLMode:  postgres.SSLModeRequire,
 	}))
 	g.Expect(gotConfig).To(Equal(cfg))
 	g.Expect(client.Config()).To(Equal(cfg))
+}
+
+// TestOpenClient_KeepsProjectedFailureClassification covers the cleanup fallback
+// for a database that disappears mid-flight: the SQLSTATE must survive this
+// helper's wrapping, because that is what tells schemaclaim cleanup to treat the
+// database as already gone instead of failing the deletion.
+func TestOpenClient_KeepsProjectedFailureClassification(t *testing.T) {
+	g := NewWithT(t)
+
+	projected := postgres.ProjectError(
+		"ping",
+		&pgconn.PgError{Code: pgerrcode.InvalidCatalogName, Message: `database "analytics" does not exist`},
+		secretvalue.FromString("admin-password"),
+	)
+
+	_, err := controller.OpenClient(
+		context.Background(),
+		postgres.Config{DBName: "analytics"},
+		func(context.Context, postgres.Config) (postgres.Client, error) {
+			return nil, projected
+		},
+	)
+
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(postgres.IsInvalidCatalogName(err)).To(BeTrue(), "the cleanup fallback depends on this")
+	g.Expect(err.Error()).To(ContainSubstring("analytics"))
+	g.Expect(err.Error()).NotTo(ContainSubstring("admin-password"))
 }
 
 type stubClient struct {
@@ -93,11 +128,53 @@ func (stubClient) Ping(context.Context) error { return nil }
 func (stubClient) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
-func (stubClient) Query(context.Context, string, ...any) (pgx.Rows, error) {
+func (stubClient) Query(context.Context, string, ...any) (postgres.Rows, error) {
 	return nil, nil
 }
 func (stubClient) QueryRow(context.Context, string, ...any) (pgx.Row, error) {
 	return nil, nil
+}
+
+func TestMarkClaimProvisioned_UpdatesMetric(t *testing.T) {
+	g := NewWithT(t)
+	t.Cleanup(func() { dbmetrics.PruneClaimMetrics(nil) })
+	dbmetrics.PruneClaimMetrics(nil)
+
+	claim := &infraApi.SchemaClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-app", Namespace: "team-a"},
+	}
+	aggregator, err := conditions.NewAggregator(
+		fwapi.ConditionTypeReady,
+		conditions.Dependent(fwapi.ConditionType(controller.ConditionProvisioned), conditions.HealthyWhenTrue),
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+	rr := &odhtypes.ReconciliationRequest{
+		Instance:   claim,
+		Conditions: conditions.NewManager(claim, aggregator),
+	}
+
+	controller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
+		conditions.WithReason("ExtensionNotAvailable"),
+		conditions.WithMessage(`required extension "vector" is not available`))
+	g.Expect(testutil.GatherAndCompare(ctrlmetrics.Registry, strings.NewReader(`
+# HELP dbclaim_provisioned Whether a DatabaseClaim or SchemaClaim is provisioned
+# TYPE dbclaim_provisioned gauge
+dbclaim_provisioned{kind="SchemaClaim",name="my-app",namespace="team-a"} 0
+`), "dbclaim_provisioned")).To(Succeed())
+	provisioned := conditions.FindStatusCondition(claim, controller.ConditionProvisioned)
+	g.Expect(provisioned).NotTo(BeNil())
+	g.Expect(provisioned.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(provisioned.Reason).To(Equal("ExtensionNotAvailable"))
+
+	controller.MarkClaimProvisioned(rr, metav1.ConditionTrue,
+		conditions.WithReason("SchemaProvisioned"),
+		conditions.WithMessage("provisioned"))
+	g.Expect(conditions.FindStatusCondition(claim, controller.ConditionProvisioned).Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(testutil.GatherAndCompare(ctrlmetrics.Registry, strings.NewReader(`
+# HELP dbclaim_provisioned Whether a DatabaseClaim or SchemaClaim is provisioned
+# TYPE dbclaim_provisioned gauge
+dbclaim_provisioned{kind="SchemaClaim",name="my-app",namespace="team-a"} 1
+`), "dbclaim_provisioned")).To(Succeed())
 }
 
 func TestEnsureClaimExtensions_EmptyNoop(t *testing.T) {
@@ -233,7 +310,7 @@ func (c *recordingClient) Exec(_ context.Context, sql string, _ ...any) (pgconn.
 	c.execSQLs = append(c.execSQLs, sql)
 	return pgconn.CommandTag{}, nil
 }
-func (c *recordingClient) Query(context.Context, string, ...any) (pgx.Rows, error) {
+func (c *recordingClient) Query(context.Context, string, ...any) (postgres.Rows, error) {
 	return nil, nil
 }
 func (c *recordingClient) QueryRow(_ context.Context, _ string, args ...any) (pgx.Row, error) {

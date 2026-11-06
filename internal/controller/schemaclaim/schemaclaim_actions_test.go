@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	. "github.com/onsi/gomega"
@@ -40,11 +41,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	moduleconfig "github.com/opendatahub-io/opendatahub-db-operator/pkg/config"
 	dbcontroller "github.com/opendatahub-io/opendatahub-db-operator/pkg/controller"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/controller/claimerrors"
+	dbmetrics "github.com/opendatahub-io/opendatahub-db-operator/pkg/metrics"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/postgres"
+	secretvalue "github.com/opendatahub-io/opendatahub-db-operator/pkg/secret"
 )
 
 func TestProvisionAction_PersistsProviderBindingBeforeEnsure(t *testing.T) {
@@ -145,6 +151,8 @@ func TestProvisionAction_ExtensionNotAvailable(t *testing.T) {
 		},
 	}}
 
+	t.Cleanup(func() { dbmetrics.PruneClaimMetrics(nil) })
+	dbmetrics.PruneClaimMetrics(nil)
 	err := m.provisionAction(context.Background(), claimTestRequest(t, cli, claim))
 	g.Expect(err).To(HaveOccurred())
 	var stop odherrors.StopError
@@ -159,6 +167,11 @@ func TestProvisionAction_ExtensionNotAvailable(t *testing.T) {
 	g.Expect(provisioned.Reason).To(Equal("ExtensionNotAvailable"))
 	g.Expect(provisioned.Message).To(ContainSubstring("vector"))
 	g.Expect(pg.execSQLsContainingCreateExtension()).To(BeFalse())
+	g.Expect(testutil.GatherAndCompare(ctrlmetrics.Registry, strings.NewReader(`
+# HELP dbclaim_provisioned Whether a DatabaseClaim or SchemaClaim is provisioned
+# TYPE dbclaim_provisioned gauge
+dbclaim_provisioned{kind="SchemaClaim",name="analytics",namespace="app"} 0
+`), "dbclaim_provisioned")).To(Succeed())
 }
 
 func TestProvisionAction_UnsupportedExtensionNeverOpensPostgres(t *testing.T) {
@@ -257,11 +270,47 @@ func TestCleanupAction_MissingDatabaseStillDropsRole(t *testing.T) {
 	g.Expect(pg.droppedRoles).To(ContainElement(role))
 }
 
+// TestCleanupAction_DatabaseDroppedAtOpenStillDropsRole covers the race the
+// invalid_catalog_name fallback exists for: DatabaseExists saw the database, but
+// the client for it fails to open because the database is gone. Cleanup must
+// read that as "nothing left inside it" — the SQLSTATE has to survive the
+// boundary, which is why Client errors are projected rather than re-rendered.
+func TestCleanupAction_DatabaseDroppedAtOpenStillDropsRole(t *testing.T) {
+	g := NewWithT(t)
+	claim, provider, adminSecret := cleanupFixtures()
+	role := dbcontroller.RoleNameForSchemaClaim(claim.Namespace, claim.Name)
+	pg := &cleanupPG{databases: map[string]bool{"analytics": true}, roles: map[string]bool{role: true}}
+
+	ctrl := &Controller{Options: Options{
+		cfg: &moduleconfig.Config{OperatorNamespace: "odh-db-operator-system"},
+		PostgresClientFactory: func(_ context.Context, cfg postgres.Config) (postgres.Client, error) {
+			if cfg.DBName == "analytics" {
+				return nil, postgres.ProjectError("ping", &pgconn.PgError{
+					Code:    pgerrcode.InvalidCatalogName,
+					Message: `database "analytics" does not exist`,
+				})
+			}
+			return pg, nil
+		},
+	}}
+
+	err := ctrl.cleanupAction(
+		context.Background(),
+		claimTestRequest(t, fakeCleanupClient(t, provider, adminSecret, claim), claim),
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pg.droppedRoles).To(ContainElement(role))
+}
+
 func TestCleanupAction_DeletesCredentialsSecret(t *testing.T) {
 	g := NewWithT(t)
 	claim, provider, adminSecret := cleanupFixtures()
 	credSecret := ownedCredentialsSecret(t, claim)
 	cli := fakeCleanupClient(t, provider, adminSecret, claim, credSecret)
+
+	t.Cleanup(func() { dbmetrics.PruneClaimMetrics(nil) })
+	dbmetrics.PruneClaimMetrics(nil)
+	dbmetrics.SetClaimProvisioned(infraApi.SchemaClaimKind, claim.Namespace, claim.Name, true)
 
 	err := newCleanupController(&cleanupPG{databases: map[string]bool{"analytics": true}}).cleanupAction(
 		context.Background(),
@@ -273,6 +322,7 @@ func TestCleanupAction_DeletesCredentialsSecret(t *testing.T) {
 	err = cli.Get(context.Background(), client.ObjectKeyFromObject(credSecret), got)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(client.IgnoreNotFound(err)).To(Succeed())
+	g.Expect(testutil.GatherAndCount(ctrlmetrics.Registry, "dbclaim_provisioned")).To(Equal(0))
 }
 
 func TestCleanupAction_DeletesStampedSecretWithStrippedOwnerRef(t *testing.T) {
@@ -285,7 +335,7 @@ func TestCleanupAction_DeletesStampedSecretWithStrippedOwnerRef(t *testing.T) {
 	}}
 	// No controller ownerRef: the credential stamp is the only proof this
 	// Secret is the claim's, and it must be enough for cleanup to delete it.
-	dbcontroller.ApplySchemaClaimCredentials(credSecret, postgres.Config{}, role, "pw", "analytics", "app_claim", claim.UID)
+	dbcontroller.ApplySchemaClaimCredentials(credSecret, postgres.Config{}, role, secretvalue.FromString("pw"), "analytics", "app_claim", claim.UID)
 	cli := fakeCleanupClient(t, provider, adminSecret, claim, credSecret)
 
 	err := newCleanupController(&cleanupPG{databases: map[string]bool{"analytics": true}}).cleanupAction(
@@ -316,7 +366,7 @@ func TestCleanupAction_SkipsForeignOwnedSecretWithForgedStamp(t *testing.T) {
 			Controller: &controller,
 		}},
 	}}
-	dbcontroller.ApplySchemaClaimCredentials(credSecret, postgres.Config{}, role, "forged-pw", "analytics", "app_claim", claim.UID)
+	dbcontroller.ApplySchemaClaimCredentials(credSecret, postgres.Config{}, role, secretvalue.FromString("forged-pw"), "analytics", "app_claim", claim.UID)
 	cli := fakeCleanupClient(t, provider, adminSecret, claim, credSecret)
 
 	err := newCleanupController(&cleanupPG{databases: map[string]bool{"analytics": true}}).cleanupAction(
@@ -559,7 +609,7 @@ func (t *cleanupPG) Exec(_ context.Context, query string, _ ...any) (pgconn.Comm
 	return pgconn.CommandTag{}, nil
 }
 
-func (t *cleanupPG) Query(context.Context, string, ...any) (pgx.Rows, error) {
+func (t *cleanupPG) Query(context.Context, string, ...any) (postgres.Rows, error) {
 	return nil, fmt.Errorf("unexpected Query")
 }
 
@@ -660,7 +710,7 @@ func (p *extensionProvisionPG) Exec(_ context.Context, query string, _ ...any) (
 	return pgconn.CommandTag{}, nil
 }
 
-func (p *extensionProvisionPG) Query(context.Context, string, ...any) (pgx.Rows, error) {
+func (p *extensionProvisionPG) Query(context.Context, string, ...any) (postgres.Rows, error) {
 	return nil, fmt.Errorf("unexpected Query")
 }
 

@@ -100,11 +100,22 @@ Apply the provider manifest with `oc apply -f databaseprovider.yaml`.
 Internal providers are single-instance PostgreSQL services. On OpenShift, the Helm chart
 installs a shared SecurityContextConstraints and use ClusterRole limited to UID/GID 26;
 the operator creates a dedicated ServiceAccount per provider and binds it to that SCC.
+When the ODH platform operator deploys this module, it passes
+`RELATED_IMAGE_POSTGRESQL_16_IMAGE` to the module Deployment when the release supplies it;
+Internal providers then use that mirrored image unless `postgres-image` is configured explicitly.
+For a standalone disconnected installation, set `operator.image.ref` and
+`config.postgres-image` to digest-pinned images available in the cluster's mirror registry.
 The SCC template is included when the cluster advertises `security.openshift.io/v1`
 (standalone `helm install`/`upgrade`) or when
 `openshift.securityContextConstraints=true` (required for the ODH operator's offline
 chart render, which does not populate Helm Capabilities). On Kind or vanilla Kubernetes
 the SCC is omitted. For a Kustomize OpenShift deploy, also apply `config/openshift`.
+
+The ServiceMonitor and its service-ca resources follow the same platform boundary. Standalone
+Helm renders them when the cluster advertises `security.openshift.io/v1`; the ODH operator's
+offline render must set `openshift.serviceCA=true`. Set
+`monitoring.serviceMonitor.collector.serviceAccount.name` and `.namespace` when the scraper
+uses a collector identity other than the chart default.
 
 For an administrator-managed database, configure an External provider with a connection Secret
 instead. See the [provider API](../api/infrastructure/v1alpha1/databaseprovider_types.go)
@@ -150,9 +161,18 @@ Check provider and claim conditions with `oc get databaseproviders` and
 `oc get databaseclaims -A`. The claim's `Provisioned` condition reports whether credentials are
 ready for the application.
 
-The Internal provider is a single PostgreSQL instance without high availability or automated backup
-and restore. External providers remain the administrator's responsibility. Claims retain database
-data when deleted by default, and the operator does not provide automated credential rotation. See
+Internal providers report `OperationalLimitations=True` with `Info` severity in their conditions.
+This condition describes the single-instance design and lack of high availability and automated
+backup and restore; it does not affect provider readiness or claim provisioning. Choose an
+appropriately managed External provider when those capabilities are required.
+
+Inspect the condition and its message with `oc get databaseprovider rhai-db -o yaml`. Dashboards
+and automation can display it as administrator guidance; use `Ready` and `Reachable` for health
+decisions. Go clients can identify it with
+[`ConditionOperationalLimitations`](../api/infrastructure/v1alpha1/databaseprovider_types.go).
+
+External providers remain the administrator's responsibility. Claims retain database data when
+deleted by default, and the operator does not provide automated credential rotation. See
 [architecture](../ARCHITECTURE.md#provider-backends) for the operational boundaries.
 
 ## Support and contributing

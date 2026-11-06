@@ -43,6 +43,13 @@ const (
 
 	tplReleaseNamespace   = "namespace: {{ .Release.Namespace }}"
 	tplServiceAccountName = `{{ default (include "chart.fullname" .) .Values.serviceAccount.name }}`
+	tplChartFullname      = `{{ include "chart.fullname" . }}`
+	serviceCAGate         = `or .Values.openshift.serviceCA ` +
+		`(.Capabilities.APIVersions.Has "security.openshift.io/v1")`
+	serviceMonitorGate         = `{{- if and .Values.monitoring.serviceMonitor.enabled (` + serviceCAGate + `) }}`
+	metricsReaderRoleName      = "odh-db-operator-metrics-reader"
+	serviceCAAnnotation        = "service.beta.openshift.io/inject-cabundle"
+	serviceCAServingAnnotation = "service.beta.openshift.io/serving-cert-secret-name"
 
 	annotationCertManagerInjectCAFrom = "cert-manager.io/inject-ca-from"
 
@@ -116,7 +123,17 @@ type chartContext struct {
 	// operator-specific rendering to. Any other Deployment in the input
 	// (there shouldn't be one today, but nothing enforces that) is left
 	// alone via transformGeneric instead.
-	operatorDeployment          types.NamespacedName
+	operatorDeployment types.NamespacedName
+	// operatorPodLabels are the operator Deployment's pod-template labels:
+	// the identity a NetworkPolicy must select before chartgen templates
+	// its webhook ingress port, so an unrelated policy in the input keeps
+	// its literal ports.
+	operatorPodLabels map[string]string
+	// operatorWebhookPort is the webhook port the operator Deployment
+	// actually declares; the NetworkPolicy transform templates the ingress
+	// rule carrying this value, so the match derives from the listener
+	// rather than a hardcoded default.
+	operatorWebhookPort         int64
 	operatorConfigMap           types.NamespacedName
 	operatorConfigMapStableName string
 	operatorServiceAccount      types.NamespacedName
@@ -251,13 +268,26 @@ func transformResource(
 		// .Values.platform.*/.Values.config templating meant for a
 		// different ConfigMap entirely. Namespace-qualified: a same-named
 		// ConfigMap in some other namespace is a different object.
+		if hasAnnotation(obj, serviceCAAnnotation) {
+			return transformServiceCAConfigMap(obj)
+		}
 		return transformGeneric(obj)
-	case gvk.ClusterRoleBinding, gvk.RoleBinding:
+	case gvk.ClusterRole:
+		return transformClusterRole(obj)
+	case gvk.ClusterRoleBinding:
+		return transformClusterRoleBinding(obj, chartCtx.operatorServiceAccount, chartCtx.operatorServiceAccountManaged)
+	case gvk.RoleBinding:
 		return transformRoleBinding(obj, chartCtx.operatorServiceAccount, chartCtx.operatorServiceAccountManaged)
 	case gvk.MutatingWebhookConfiguration, gvk.ValidatingWebhookConfiguration:
 		return transformWebhook(obj)
 	case gvk.CertManagerCertificate:
 		return transformCertificate(obj)
+	case gvk.ServiceMonitor:
+		return transformServiceMonitor(obj)
+	case gvk.Service:
+		return transformService(obj)
+	case gvk.NetworkPolicy:
+		return transformNetworkPolicy(obj, chartCtx.operatorPodLabels, chartCtx.operatorWebhookPort)
 	default:
 		return transformGeneric(obj)
 	}
@@ -595,6 +625,21 @@ func transformRoleBinding(
 	operatorServiceAccount types.NamespacedName,
 	renameManaged bool,
 ) (string, error) {
+	roleRef, found, err := unstructured.NestedMap(obj.Object, "roleRef")
+	if err != nil {
+		return "", fmt.Errorf("reading roleRef: %w", err)
+	}
+	if found {
+		roleName, _ := roleRef["name"].(string)
+		roleKind, _ := roleRef["kind"].(string)
+		if roleKind == "ClusterRole" && strings.HasPrefix(roleName, "odh-db-operator-") {
+			roleRef["name"] = releaseScopedName(roleName)
+			if err := unstructured.SetNestedMap(obj.Object, roleRef, "roleRef"); err != nil {
+				return "", err
+			}
+		}
+	}
+
 	if err := stampOperatorSubjectPlaceholders(obj, operatorServiceAccount, renameManaged); err != nil {
 		return "", fmt.Errorf("role binding %s: %w", obj.GetName(), err)
 	}
@@ -608,6 +653,85 @@ func transformRoleBinding(
 	raw = replaceSubjectPlaceholders(raw)
 
 	return raw, nil
+}
+
+func releaseScopedName(name string) string {
+	suffix := strings.TrimPrefix(name, "odh-db-operator-")
+	return fmt.Sprintf(
+		`{{ include "chart.clusterResourceName" (dict "root" . "suffix" %q) }}`,
+		suffix,
+	)
+}
+
+func transformClusterRole(obj *unstructured.Unstructured) (string, error) {
+	name := obj.GetName()
+	if strings.HasPrefix(name, "odh-db-operator-") {
+		obj.SetName(releaseScopedName(name))
+	}
+	return transformGeneric(obj)
+}
+
+func transformClusterRoleBinding(
+	obj *unstructured.Unstructured,
+	operatorServiceAccount types.NamespacedName,
+	renameManaged bool,
+) (string, error) {
+	roleRef, found, err := unstructured.NestedMap(obj.Object, "roleRef")
+	if err != nil {
+		return "", fmt.Errorf("reading roleRef: %w", err)
+	}
+	if !found {
+		return "", fmt.Errorf("roleRef is missing")
+	}
+	roleName, _ := roleRef["name"].(string)
+	metricsReaderBinding := strings.HasSuffix(roleName, "-metrics-reader")
+	if roleName != "" {
+		roleRef["name"] = releaseScopedName(roleName)
+		if err := unstructured.SetNestedMap(obj.Object, roleRef, "roleRef"); err != nil {
+			return "", err
+		}
+	}
+
+	if err := stampOperatorSubjectPlaceholders(obj, operatorServiceAccount, renameManaged); err != nil {
+		return "", fmt.Errorf("role binding %s: %w", obj.GetName(), err)
+	}
+
+	if metricsReaderBinding {
+		if err := configureCollectorSubject(obj); err != nil {
+			return "", err
+		}
+	}
+
+	obj.SetName(releaseScopedName(obj.GetName()))
+	raw, err := marshalResource(obj)
+	if err != nil {
+		return "", err
+	}
+
+	raw = replaceNamespace(raw)
+	raw = replaceSubjectPlaceholders(raw)
+	return raw, nil
+}
+
+func configureCollectorSubject(obj *unstructured.Unstructured) error {
+	subjects, found, err := unstructured.NestedSlice(obj.Object, "subjects")
+	if err != nil {
+		return fmt.Errorf("reading subjects: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("subjects are missing")
+	}
+
+	for _, item := range subjects {
+		subject, ok := item.(map[string]any)
+		if !ok || subject["kind"] != "ServiceAccount" {
+			continue
+		}
+		subject["name"] = "{{ .Values.monitoring.serviceMonitor.collector.serviceAccount.name }}"
+		subject["namespace"] = "{{ .Values.monitoring.serviceMonitor.collector.serviceAccount.namespace }}"
+	}
+
+	return unstructured.SetNestedSlice(obj.Object, subjects, "subjects")
 }
 
 // stampOperatorSubjectPlaceholders overwrites the namespace (always, when
@@ -801,6 +925,187 @@ func transformGeneric(obj *unstructured.Unstructured) (string, error) {
 	}
 
 	return raw, nil
+}
+
+func transformServiceMonitor(obj *unstructured.Unstructured) (string, error) {
+	raw, err := transformGeneric(obj)
+	if err != nil {
+		return "", err
+	}
+
+	raw = replaceServiceMonitorServerName(raw)
+
+	return serviceMonitorGate + "\n" + raw + "\n{{- end }}", nil
+}
+
+func hasAnnotation(obj *unstructured.Unstructured, key string) bool {
+	_, found := obj.GetAnnotations()[key]
+	return found
+}
+
+func transformServiceCAConfigMap(obj *unstructured.Unstructured) (string, error) {
+	raw, err := transformGeneric(obj)
+	if err != nil {
+		return "", err
+	}
+
+	return "{{- if " + serviceCAGate + " }}\n" + raw + "\n{{- end }}", nil
+}
+
+func transformService(obj *unstructured.Unstructured) (string, error) {
+	raw, err := transformGeneric(obj)
+	if err != nil {
+		return "", err
+	}
+	if !hasAnnotation(obj, serviceCAServingAnnotation) {
+		return raw, nil
+	}
+
+	return gateServiceAnnotation(raw), nil
+}
+
+func gateServiceAnnotation(raw string) string {
+	lines := strings.Split(raw, "\n")
+	for index, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), serviceCAServingAnnotation+":") {
+			continue
+		}
+
+		indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+		gated := []string{
+			indent + "{{- if " + serviceCAGate + " }}",
+			line,
+			indent + "{{- end }}",
+		}
+		lines = append(lines[:index], append(gated, lines[index+1:]...)...)
+		return strings.Join(lines, "\n")
+	}
+	return raw
+}
+
+// replaceServiceMonitorServerName replaces the namespace segment in
+// tlsConfig.serverName with the Helm release namespace template.
+// serverName follows the pattern: <service>.<namespace>.svc[.cluster.local]
+func replaceServiceMonitorServerName(raw string) string {
+	lines := strings.Split(raw, "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if !strings.HasPrefix(trimmed, "serverName: ") || !strings.Contains(trimmed, ".svc") {
+			continue
+		}
+
+		value := strings.TrimPrefix(trimmed, "serverName: ")
+		parts := strings.SplitN(value, ".", 3)
+		if len(parts) < 3 {
+			continue
+		}
+
+		indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+		lines[i] = indent + "serverName: " + parts[0] + ".{{ .Release.Namespace }}." + parts[2]
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// transformNetworkPolicy templates the webhook ingress port of the
+// operator's own NetworkPolicy from the same chart value the Deployment
+// listens on (controller.webhook.port). The rule to template is found by the
+// port the operator Deployment actually declares, so a kustomize-side port
+// change flows through instead of silently desyncing the policy from the
+// listener, which would leave the API server's webhook calls denied by this
+// very policy. A policy that does not select the operator pod keeps its
+// literal ports.
+func transformNetworkPolicy(
+	obj *unstructured.Unstructured,
+	operatorPodLabels map[string]string,
+	operatorWebhookPort int64,
+) (string, error) {
+	if !policySelectsOperator(obj, operatorPodLabels) || operatorWebhookPort <= 0 {
+		return transformGeneric(obj)
+	}
+
+	ingress, found, err := unstructured.NestedSlice(obj.Object, "spec", "ingress")
+	if err != nil {
+		return "", fmt.Errorf("networkpolicy %s: reading ingress rules: %w", obj.GetName(), err)
+	}
+	if !found {
+		return transformGeneric(obj)
+	}
+
+	stamped := false
+	for _, item := range ingress {
+		rule, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		ports, found, err := unstructured.NestedSlice(rule, "ports")
+		if err != nil || !found {
+			continue
+		}
+		for _, portItem := range ports {
+			port, ok := portItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch portValue := port["port"].(type) {
+			case int64:
+				if portValue == operatorWebhookPort {
+					port["port"] = webhookPortPlaceholder
+					stamped = true
+				}
+			case float64:
+				if portValue == float64(operatorWebhookPort) {
+					port["port"] = webhookPortPlaceholder
+					stamped = true
+				}
+			}
+		}
+		if err := unstructured.SetNestedSlice(rule, ports, "ports"); err != nil {
+			return "", fmt.Errorf("networkpolicy %s: stamping webhook port: %w", obj.GetName(), err)
+		}
+	}
+	if !stamped {
+		// The operator Deployment declares a webhook port but this policy,
+		// which selects the operator pod, admits no ingress on it. Emitting
+		// the policy with literal ports would silently reintroduce the
+		// listener/allowance desync this transform exists to prevent, so
+		// fail generation and make the mismatch explicit.
+		return "", fmt.Errorf(
+			"networkpolicy %s: no ingress rule admits the operator webhook port %d; "+
+				"update the policy in config/default to match the Deployment's %q port",
+			obj.GetName(), operatorWebhookPort, webhookServerPortName)
+	}
+	if err := unstructured.SetNestedSlice(obj.Object, ingress, "spec", "ingress"); err != nil {
+		return "", fmt.Errorf("networkpolicy %s: stamping webhook port: %w", obj.GetName(), err)
+	}
+
+	raw, err := marshalResource(obj)
+	if err != nil {
+		return "", err
+	}
+	raw = replaceNamespace(raw)
+	raw = strings.ReplaceAll(raw, webhookPortPlaceholder, tplWebhookPort)
+	return raw, nil
+}
+
+// policySelectsOperator reports whether the policy's podSelector labels are
+// all carried by the operator Deployment's pod template.
+func policySelectsOperator(obj *unstructured.Unstructured, operatorPodLabels map[string]string) bool {
+	if len(operatorPodLabels) == 0 {
+		return false
+	}
+	selector, found, err := unstructured.NestedStringMap(obj.Object, "spec", "podSelector", "matchLabels")
+	if err != nil || !found || len(selector) == 0 {
+		return false
+	}
+	for key, value := range selector {
+		if operatorPodLabels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 // marshalResource marshals an unstructured resource to YAML.
