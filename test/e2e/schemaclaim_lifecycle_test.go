@@ -302,6 +302,8 @@ func TestSchemaClaimLifecycle(t *testing.T) {
 		"cross_read_denied",
 	)
 
+	runAccessorSearchPathConsumer(t, ctx, cli, restCfg, namespace.Name, retainSecretName, image, tlsEnabled)
+
 	retainSchema := string(retainSecret.Data[postgres.SecretKeySchema])
 	retainRole := string(retainSecret.Data[postgres.SecretKeyUser])
 	deleteSchema := string(deleteSecret.Data[postgres.SecretKeySchema])
