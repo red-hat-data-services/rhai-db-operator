@@ -57,6 +57,10 @@ func TestInternalProviderClaimLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
 	t.Cleanup(cancel)
 
+	// The operand CRDs must exist for providers and claims; when this test
+	// is shuffled first, enable the module so it stays order-independent.
+	ensureOperandCRDs(t, ctx, cli)
+
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "odh-db-internal-"}}
 	g.Expect(cli.Create(ctx, namespace)).To(Succeed())
 	t.Cleanup(func() {
@@ -177,6 +181,7 @@ func TestInternalProviderClaimLifecycle(t *testing.T) {
 		adminSecretCopy.Name, string(credentials.Data["dbname"]),
 		string(credentials.Data["user"]), expectedSSLMode, image, tlsEnabled)
 	runConsumer(t, ctx, cli, restCfg, namespace.Name, claim.Name, image, tlsEnabled)
+	runAccessorConsumer(t, ctx, cli, restCfg, namespace.Name, claim.Name, image, tlsEnabled)
 
 	g.Expect(cli.Delete(ctx, claim, client.Preconditions{UID: &claim.UID})).To(Succeed())
 	g.Eventually(func(g Gomega) {

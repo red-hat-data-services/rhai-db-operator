@@ -26,6 +26,18 @@ envtest packages and needs their environments.
 | Integration | `make test-integration` | Operator behavior against the current kubeconfig cluster. | Dedicated test cluster and matching `TEST_INTEGRATION_CONTEXT`. |
 | End to end | `make test-e2e-providers` | Internal and External provider claim lifecycles on Kind. | Existing isolated Kind cluster and Podman CLI; the cert-manager profile and External provider administrator Secret described below. |
 
+The e2e setup and teardown delete operand resources **cluster-wide** — every
+DatabaseProvider, DatabaseClaim, and SchemaClaim on the target cluster, with
+their data — so the cluster must be exclusive and disposable. Both targets
+require an explicit acknowledgment:
+
+```sh
+make test-e2e-providers ... E2E_ALLOW_CRD_DELETE=1
+```
+
+CI sets it automatically against throwaway clusters; the flag exists so the
+deletion is a deliberate choice on any other cluster.
+
 The [CI workflow](.github/workflows/ci.yaml) runs unit and envtest suites. The separate
 [E2E workflow](.github/workflows/e2e.yaml) runs both cert-manager profiles.
 
@@ -50,6 +62,10 @@ ODH_E2E_CONSUMER_IMAGE=<bash-and-psql image, e.g. postgres:16> \
 go test ./test/e2e/ -run TestOperatorRunsUnderDefaultDenyBaseline -v -timeout 25m
 ```
 
+The baseline test is order-independent: when invoked alone it enables the
+module itself after the CNI gate, so the operand CRDs its providers depend on
+exist.
+
 The E2E workflow's `Default-deny baseline (Calico)` job runs this scenario
 continuously on every pull request, on a Kind cluster whose default CNI is
 replaced with Calico so NetworkPolicy is enforced.
@@ -71,14 +87,17 @@ and its administrator Secret, then run the suite, for example:
 bash test/e2e/scripts/setup-external-postgres.sh db-operator-dev
 make test-e2e-providers KIND_CLUSTER=db-operator-dev E2E_CERT_MANAGER_PROFILE=present \
   E2E_EXTERNAL_ADMIN_SECRET_NAMESPACE=external-postgres \
-  E2E_EXTERNAL_ADMIN_SECRET_NAME=external-postgres-admin
+  E2E_EXTERNAL_ADMIN_SECRET_NAME=external-postgres-admin \
+  E2E_EXTERNAL_PLAINTEXT_ADMIN_SECRET_NAMESPACE=external-postgres-plaintext \
+  E2E_EXTERNAL_PLAINTEXT_ADMIN_SECRET_NAME=external-postgres-admin
 ```
 
 Use the `absent` profile on a cluster without cert-manager. The [E2E workflow](.github/workflows/e2e.yaml)
 shows setup for both profiles. E2E setup builds and loads an image with Podman; teardown removes the
 configured e2e namespace and `DatabaseService/default-db-operator`, so use an isolated cluster.
-The `external-postgres` namespace created by the setup script remains after the suite. Uncached
-`Containerfile` base images may require registry access.
+The setup script leaves both `external-postgres` (TLS) and `external-postgres-plaintext` namespaces
+after the suite. Prefer/allow plaintext e2e skips when the plaintext Secret env vars are unset.
+Uncached `Containerfile` base images may require registry access.
 
 To exercise the packaged runner, build it with `make e2e-image-build`, then run:
 
